@@ -3,14 +3,16 @@ import math
 from datetime import datetime
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.shared import Pt
+from docx.shared import Inches, Pt
+import matplotlib.patches as patches
+import matplotlib.pyplot as plt
 import streamlit as st
 
 # ==========================================
-# 1. 頁面設定與資料庫 (避開中括號確保語法穩定)
+# 1. 頁面設定與資料庫
 # ==========================================
 st.set_page_config(
-    page_title="連續壁錯位植筋反向檢核與替代方案系統",
+    page_title="連續壁錯位植筋：批次總表與每公尺雙排配置系統",
     page_icon="🧱",
     layout="wide",
 )
@@ -36,13 +38,10 @@ STEEL_DB = {
 # 2. 核心反算引擎 (第 25 章 & 第 17 章)
 # ==========================================
 def calc_ch25_required_depth(db, fy, fc, spacing_s, is_lap_splice):
-    """依據 ACI 318 第 25 章反算連續壁單排植筋最小所需深度"""
-    # 連續壁保護層與間距取半中心距 cb = s / 2 (並扣除淨間距影響)
     cb = max((spacing_s - db) / 2.0, 1.0 * db)
-    ktr = 0.0  # 連續壁後置植筋無橫向圍束箍筋
+    ktr = 0.0
     confinement = min((cb + ktr) / db, 2.5)
-
-    psi_t = 1.0  # 垂直壁面水平植筋
+    psi_t = 1.0
     psi_e = 1.0
     psi_s = 0.8 if db <= 1.91 else 1.0
     psi_g = 1.0 if fy <= 4200 else 1.15
@@ -54,57 +53,49 @@ def calc_ch25_required_depth(db, fy, fc, spacing_s, is_lap_splice):
     )
     ld = max(ld_raw, 30.0)
     req_depth = ld * 1.3 if is_lap_splice else ld
-    return req_depth, confinement
+    return req_depth
 
 
 def calc_ch17_group_capacity(hef, db, Ab, fy, fu, fc, tau_k, spacing_s, n_row=10):
-    """計算整排連續壁植筋(取10支代表連續排)在指定埋深 hef 下的單支平均設計強度與標稱強度"""
     futa = min(fu, 1.9 * fy, 8800.0)
     phi_Nsa = 0.75 * (Ab * futa)
 
-    # 1. 群組混凝土錐狀破裂 Ncbg (整排連續排列)
     Nb = 16.0 * 1.0 * math.sqrt(fc) * (hef**1.5)
     ANco = 9.0 * (hef**2)
-    # 假設連續壁上下方向無邊距截斷 (3*hef)，水平方向受中心距 spacing_s 截斷
     bx = (n_row - 1) * min(spacing_s, 3.0 * hef) + 3.0 * hef
     by = 3.0 * hef
     ANc = bx * by
-    Ncbg_group = (ANc / ANco) * 1.0 * 1.0 * Nb  # 開裂混凝土 psi_c,N = 1.0
-    Ncbg_per_bar = Ncbg_group / n_row
+    Ncbg_per_bar = ((ANc / ANco) * Nb) / n_row
     phi_Ncb_per_bar = 0.65 * Ncbg_per_bar
 
-    # 2. 群組化學黏結強度 Nag
     Nba = 1.0 * tau_k * math.pi * db * hef
     cNa = 10.0 * db * math.sqrt(tau_k / 77.3)
     ANao = (2.0 * cNa) ** 2
     bxa = (n_row - 1) * min(spacing_s, 2.0 * cNa) + 2.0 * cNa
     bya = 2.0 * cNa
     ANa = bxa * bya
-    Nag_group = (ANa / ANao) * 1.0 * Nba
-    Nag_per_bar = Nag_group / n_row
+    Nag_per_bar = ((ANa / ANao) * Nba) / n_row
     phi_Na_per_bar = 0.65 * Nag_per_bar
 
     phi_Nn = min(phi_Nsa, phi_Ncb_per_bar, phi_Na_per_bar)
     nominal_non_steel = min(Ncbg_per_bar, Nag_per_bar)
-    return phi_Nn, phi_Nsa, phi_Ncb_per_bar, phi_Na_per_bar, nominal_non_steel
+    return phi_Nn, nominal_non_steel
 
 
 def solve_ch17_required_depth(
     db, Ab, fy, fu, fc, tau_k, spacing_s, stress_ratio, require_ductile
 ):
-    """反向二分搜尋法：求出滿足目標受力與延性條件的最小埋深 hef (cm)"""
     target_Nu = (Ab * fy) * stress_ratio
     max_hef_limit = 20.0 * db
     min_hef_limit = 4.0 * db
 
-    # 先檢查在 20*db 極限深度下是否能達標
-    phi_Nn_max, _, _, _, nom_ns_max = calc_ch17_group_capacity(
+    phi_Nn_max, nom_ns_max = calc_ch17_group_capacity(
         max_hef_limit, db, Ab, fy, fu, fc, tau_k, spacing_s
     )
     ductile_ok_max = (nom_ns_max >= Ab * fy) if require_ductile else True
 
     if phi_Nn_max < target_Nu or not ductile_ok_max:
-        return None, phi_Nn_max, target_Nu, max_hef_limit
+        return None, phi_Nn_max, target_Nu
 
     low = min_hef_limit
     high = max_hef_limit
@@ -112,7 +103,7 @@ def solve_ch17_required_depth(
 
     for _ in range(40):
         mid = (low + high) / 2.0
-        phi_Nn, _, _, _, nom_ns = calc_ch17_group_capacity(
+        phi_Nn, nom_ns = calc_ch17_group_capacity(
             mid, db, Ab, fy, fu, fc, tau_k, spacing_s
         )
         cond_strength = phi_Nn >= target_Nu
@@ -124,159 +115,327 @@ def solve_ch17_required_depth(
         else:
             low = mid
 
-    return best_hef, phi_Nn_max, target_Nu, max_hef_limit
+    return best_hef, phi_Nn_max, target_Nu
 
 
 # ==========================================
-# 3. 自動產生替代方案演算法 (降號數、雙排錯開)
+# 3. 每公尺寬度配筋換算 & 雙排錯開配置圖繪製
 # ==========================================
-def find_alternative_schemes(
-    orig_rebar_key, orig_Ab, orig_spacing, max_allow_depth, fy, fu, fc, tau_k, is_lap_splice, stress_ratio, require_ductile
+def calc_per_meter_schemes(
+    orig_rebar_key, orig_Ab, orig_spacing, max_allow_depth, fy, fu, fc, tau_k, is_lap, stress_ratio, require_ductile
 ):
-    """當原號數超限時，搜尋所有符合 <= max_allow_depth 的小號數加密替代方案"""
-    alternatives = []
-    # 候選小號數鋼筋清單 (由大到小測試)
-    candidate_keys = ("#7 (D22)", "#6 (D19)", "#5 (D16)", "#4 (D13)")
+    """計算每 100 cm 寬度的原設計總斷面積，並產生雙排錯開小號數替代方案"""
+    bars_per_m_orig = 100.0 / orig_spacing
+    As_per_m_orig = bars_per_m_orig * orig_Ab
+
+    schemes = []
+    candidate_keys = ("#6 (D19)", "#5 (D16)", "#4 (D13)")
+    row_vertical_gap = 10.0  # 上下雙排垂直排距 10 cm
 
     for cand_key in candidate_keys:
         cand_db = REBAR_DB[cand_key]["db"]
         cand_Ab = REBAR_DB[cand_key]["Ab"]
-
-        # 只考慮比原鋼筋小的號數
         if cand_Ab >= orig_Ab:
             continue
 
-        # 計算每支原鋼筋需要幾支候選小鋼筋替代 (倍數 mult = 2, 3, 4)
-        for mult in (2, 3, 4):
-            total_new_Ab = mult * cand_Ab
-            if total_new_Ab < orig_Ab * 0.96:  # 允許 4% 內工程誤差
+        # 計算每公尺至少需要幾支小號數鋼筋 (無條件進位至偶數，方便上下雙排對稱排列)
+        min_bars_needed = math.ceil(As_per_m_orig / cand_Ab)
+        if min_bars_needed % 2 != 0:
+            min_bars_needed += 1
+
+        # 測試每公尺總支數 (min_bars_needed 或 +2)
+        for total_bars_m in (min_bars_needed, min_bars_needed + 2):
+            bars_each_row = total_bars_m / 2.0
+            s_each_row = 100.0 / bars_each_row  # 單排水平中心距 (cm)
+            # 梅花錯開後的斜向最小中心距 (cm)
+            diag_spacing = math.hypot(s_each_row / 2.0, row_vertical_gap)
+
+            if diag_spacing < 9.5 or s_each_row < 10.0:
                 continue
 
-            # 若拆成 mult 支，採用雙排交錯配置，每排等效水平中心距可放大
-            rows = 2 if mult >= 2 else 1
-            eff_spacing = orig_spacing * (rows / mult)
-            # 確保交錯後的實際淨中心距不小於 10 cm (斜向中心距檢核)
-            diag_spacing = math.hypot(eff_spacing, 10.0) if rows == 2 else eff_spacing
-            if diag_spacing < 9.5:
-                continue
-
-            # 檢核第 25 章深度
-            d25, _ = calc_ch25_required_depth(cand_db, fy, fc, diag_spacing, is_lap_splice)
-            # 檢核第 17 章深度
-            d17, _, _, _ = solve_ch17_required_depth(
+            d25 = calc_ch25_required_depth(cand_db, fy, fc, diag_spacing, is_lap)
+            d17, _, _ = solve_ch17_required_depth(
                 cand_db, cand_Ab, fy, fu, fc, tau_k, diag_spacing, stress_ratio, require_ductile
             )
 
-            valid_d25 = d25 <= max_allow_depth
-            valid_d17 = (d17 is not None) and (d17 <= max_allow_depth)
+            ok25 = math.ceil(d25) <= max_allow_depth
+            ok17 = (d17 is not None) and (math.ceil(d17) <= max_allow_depth)
 
-            if valid_d25 or valid_d17:
-                rec_depth = math.ceil(min(d25 if valid_d25 else 999, d17 if valid_d17 else 999))
-                method_tag = (
-                    "第 25 章伸展法"
-                    if valid_d25 and (not valid_d17 or d25 <= d17 + 3)
-                    else "第 17 章高強藥劑法"
-                )
-                alternatives.append(
+            if ok25 or ok17:
+                rec_depth = math.ceil(min(d25 if ok25 else 999, d17 if ok17 else 999))
+                As_new_m = total_bars_m * cand_Ab
+                schemes.append(
                     {
-                        "方案說明": f"每 1 支 {orig_rebar_key} ➔ 改用 {mult} 支 {cand_key} (上下雙排錯開)",
-                        "斷面積比": f"{total_new_Ab:.2f} / {orig_Ab:.2f} cm² ({total_new_Ab/orig_Ab*100:.0f}%)",
-                        "建議最小埋深": f"{rec_depth} cm (≤ {max_allow_depth} cm)",
-                        "適用規範路徑": method_tag,
-                        "現場配置提醒": f"雙排上下排距 10 cm 梅花錯開，斜向中心距 {diag_spacing:.1f} cm",
+                        "方案名稱": f"雙排交錯 {cand_key} @ {s_each_row:.1f} cm (上下各一排)",
+                        "cand_key": cand_key,
+                        "cand_db": cand_db,
+                        "total_bars_m": int(total_bars_m),
+                        "s_each_row": round(s_each_row, 1),
+                        "row_gap": row_vertical_gap,
+                        "diag_spacing": round(diag_spacing, 1),
+                        "As_orig_m": round(As_per_m_orig, 2),
+                        "As_new_m": round(As_new_m, 2),
+                        "ratio_pct": round(As_new_m / As_per_m_orig * 100, 1),
+                        "rec_depth": max(rec_depth, 30),
+                        "method": "第25章伸展法" if ok25 else "第17章高強藥劑法",
                     }
                 )
-                break  # 該號數找到最小可行支數即跳下一號數
+                break
 
-    return alternatives
+    return schemes, bars_per_m_orig, As_per_m_orig
+
+
+def plot_staggered_layout(orig_rebar, orig_spacing, scheme):
+    """繪製連續壁每公尺寬度 (100 cm) 雙排梅花錯開鑽孔配置示意圖"""
+    fig, ax = plt.subplots(figsize=(8.5, 3.6), dpi=150)
+
+    # 畫連續壁 100 cm 寬度背景區塊
+    wall_rect = patches.Rectangle(
+        (0, 0), 100, 36, linewidth=1.5, edgecolor="#475569", facecolor="#F1F5F9"
+    )
+    ax.add_patch(wall_rect)
+
+    # 標示原設計錯位鋼筋位置 (灰色虛線圈，作為對照)
+    n_orig = int(100 // orig_spacing) + 1
+    for i in range(n_orig):
+        xo = i * orig_spacing + (orig_spacing / 2.0)
+        if xo <= 98:
+            c_orig = patches.Circle(
+                (xo, 18), radius=1.3, fill=False, linestyle="--", edgecolor="#94A3B8", linewidth=1.2
+            )
+            ax.add_patch(c_orig)
+
+    # 畫替代方案：上排 (y = 23 cm) 與下排 (y = 13 cm) 梅花交錯
+    s_row = scheme["s_each_row"]
+    y_top = 23.0
+    y_bot = 13.0
+    r_bar = max(scheme["cand_db"] * 0.7, 1.1)
+
+    top_xs = []
+    bot_xs = []
+
+    x_curr = s_row / 4.0
+    while x_curr <= 98.0:
+        top_xs.append(x_curr)
+        ax.add_patch(patches.Circle((x_curr, y_top), radius=r_bar, color="#DC2626", zorder=4))
+        x_curr += s_row
+
+    x_curr_b = (s_row / 4.0) + (s_row / 2.0)
+    while x_curr_b <= 98.0:
+        bot_xs.append(x_curr_b)
+        ax.add_patch(patches.Circle((x_curr_b, y_bot), radius=r_bar, color="#2563EB", zorder=4))
+        x_curr_b += s_row
+
+    # 標註尺寸線：單排水平間距 s_row
+    if len(top_xs) >= 2:
+        x1, x2 = top_xs[0], top_xs[1]
+        ax.annotate(
+            "",
+            xy=(x1, 29),
+            xytext=(x2, 29),
+            arrowprops=dict(arrowstyle="<->", color="#DC2626", lw=1.3),
+        )
+        ax.text(
+            (x1 + x2) / 2,
+            30.5,
+            f"Upper Row s = {s_row} cm",
+            color="#DC2626",
+            ha="center",
+            fontsize=8.5,
+            fontweight="bold",
+        )
+
+    # 標註斜向淨中心距與排距
+    if len(top_xs) >= 1 and len(bot_xs) >= 1:
+        ax.plot([top_xs[0], bot_xs[0]], [y_top, y_bot], color="#059669", linestyle="-.", lw=1.5, zorder=3)
+        ax.text(
+            (top_xs[0] + bot_xs[0]) / 2 + 1.5,
+            (y_top + y_bot) / 2,
+            f"Diag = {scheme['diag_spacing']} cm\n(dy = {scheme['row_gap']:.0f} cm)",
+            color="#059669",
+            fontsize=8,
+            fontweight="bold",
+            va="center",
+        )
+
+    # 圖例說明 (使用英文避免雲端 Linux 缺少中文字型產生方框亂碼)
+    ax.scatter([], [], color="#DC2626", label=f"Upper Rebar: {scheme['cand_key']} @ {s_row} cm")
+    ax.scatter([], [], color="#2563EB", label=f"Lower Rebar: {scheme['cand_key']} @ {s_row} cm (Staggered)")
+    ax.scatter([], [], facecolors="none", edgecolors="#94A3B8", linestyle="--", label=f"Original Misaligned: {orig_rebar} @ {orig_spacing} cm")
+
+    ax.set_xlim(-2, 102)
+    ax.set_ylim(0, 38)
+    ax.set_xlabel("Diaphragm Wall Width = 100 cm (1.0 m Unit Strip)", fontsize=9.5, fontweight="bold")
+    ax.set_ylabel("Elevation (cm)", fontsize=9)
+    ax.set_title(
+        f"Staggered Drilling Layout (hef = {scheme['rec_depth']} cm, As = {scheme['As_new_m']} cm2/m)",
+        fontsize=10.5,
+        fontweight="bold",
+    )
+    ax.legend(loc="lower right", fontsize=7.8, framealpha=0.9)
+    ax.grid(True, linestyle=":", alpha=0.5)
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=180)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
 
 
 # ==========================================
-# 4. Word 計算書產生函數
+# 4. 批次計算 #4 ～ #10 全號數總表
 # ==========================================
-def build_word_doc(inputs_dict, summary_dict, alt_list):
+def run_batch_all_rebars(
+    spacing_s, max_allow_depth, fy, fu, fc, tau_k, is_lap, stress_ratio, require_ductile
+):
+    batch_rows = []
+    for r_key, props in REBAR_DB.items():
+        r_db = props["db"]
+        r_Ab = props["Ab"]
+
+        d25 = math.ceil(calc_ch25_required_depth(r_db, fy, fc, spacing_s, is_lap))
+        d17_raw, _, _ = solve_ch17_required_depth(
+            r_db, r_Ab, fy, fu, fc, tau_k, spacing_s, stress_ratio, require_ductile
+        )
+        d17_str = f"{math.ceil(d17_raw)} cm" if d17_raw is not None else "超限 (錐裂控制)"
+        d17_ok = (d17_raw is not None) and (math.ceil(d17_raw) <= max_allow_depth)
+        d25_ok = d25 <= max_allow_depth
+
+        if d25_ok or d17_ok:
+            best_d = min(d25 if d25_ok else 999, math.ceil(d17_raw) if d17_ok else 999)
+            status = f"✅ 合格 (建議埋深 {max(best_d, 30)} cm)"
+            alt_text = "原號數可直接施作"
+        else:
+            status = f"❌ 超過 {max_allow_depth:.0f} cm 上限"
+            sub_schemes, _, _ = calc_per_meter_schemes(
+                r_key,
+                r_Ab,
+                spacing_s,
+                max_allow_depth,
+                fy,
+                fu,
+                fc,
+                tau_k,
+                is_lap,
+                stress_ratio,
+                require_ductile,
+            )
+            if sub_schemes:
+                top_s = next(iter(sub_schemes))
+                alt_text = f"{top_s['方案名稱']} (埋深 {top_s['rec_depth']} cm)"
+            else:
+                alt_text = "需加大間距或改用機械續接"
+
+        batch_rows.append(
+            {
+                "鋼筋號數": r_key,
+                "斷面積 Ab (cm²)": f"{r_Ab:.3f}",
+                "第25章所需埋深": f"{d25} cm",
+                "第17章高強藥劑埋深": d17_str,
+                "檢核判定": status,
+                "每公尺雙排替代方案建議": alt_text,
+            }
+        )
+    return batch_rows
+
+
+# ==========================================
+# 5. Word 計算書產生函數 (含全號數總表與配置圖)
+# ==========================================
+def build_comprehensive_word_doc(
+    inputs_dict, batch_rows, target_rebar, orig_spacing, per_m_schemes, fig_buf
+):
     doc = Document()
     style = doc.styles["Normal"]
     style.font.name = "Microsoft JhengHei"
-    style.font.size = Pt(10.5)
+    style.font.size = Pt(10)
 
-    h = doc.add_heading("連續壁預埋筋錯位—後置植筋反向檢核與替代方案計算書", level=1)
-    h.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    title = doc.add_heading("連續壁預埋筋錯位—植筋反向檢核、批次總表與替代配置計算書", level=1)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-    p = doc.add_paragraph(
-        f"計算時間：{datetime.now().strftime('%Y-%m-%d %H:%M')}  |  單位：公制 (cm, kgf, kgf/cm²)"
+    p_meta = doc.add_paragraph(
+        f"計算日期：{datetime.now().strftime('%Y-%m-%d %H:%M')}  |  單位系統：公制 (cm, kgf, kgf/cm²)"
     )
-    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    p_meta.alignment = WD_ALIGN_PARAGRAPH.RIGHT
 
-    def add_dict_table(title_str, col1_name, col2_name, data_map):
-        doc.add_heading(title_str, level=2)
-        tbl = doc.add_table(rows=1, cols=2)
-        tbl.style = "Table Grid"
-        for idx, cell in enumerate(next(iter(tbl.rows)).cells):
-            cell.text = col1_name if idx == 0 else col2_name
-        for k, v in data_map.items():
-            row_c = tbl.add_row().cells
-            for idx, cell in enumerate(row_c):
-                cell.text = str(k) if idx == 0 else str(v)
+    # 一、基本參數表
+    doc.add_heading("一、 連續壁工程條件與設計參數", level=2)
+    t1 = doc.add_table(rows=1, cols=2)
+    t1.style = "Table Grid"
+    for idx, cell in enumerate(next(iter(t1.rows)).cells):
+        cell.text = "參數項目" if idx == 0 else "設定數值"
+    for k, v in inputs_dict.items():
+        rc = t1.add_row().cells
+        for idx, cell in enumerate(rc):
+            cell.text = str(k) if idx == 0 else str(v)
 
-    add_dict_table("一、 連續壁工程與設計條件", "條件項目", "設定數值", inputs_dict)
-    add_dict_table("二、 原設計號數反向埋深檢核結果", "檢核指標", "反算結果與判定", summary_dict)
+    # 二、#4 ~ #10 批次檢核總表
+    doc.add_heading("二、 #4 ～ #10 全號數反向埋深檢核總表", level=2)
+    headers = ("鋼筋號數", "斷面積 Ab", "第25章埋深", "第17章埋深", "檢核判定", "每公尺雙排替代方案")
+    t2 = doc.add_table(rows=1, cols=len(headers))
+    t2.style = "Table Grid"
+    for idx, cell in enumerate(next(iter(t2.rows)).cells):
+        cell.text = headers[idx]
 
-    doc.add_heading("三、 替代方案建議明細 (符合最大允許深度限制)", level=2)
-    if alt_list:
-        for i, item in enumerate(alt_list, 1):
-            doc.add_paragraph(f"【替代方案 {i}】{item['方案說明']}", style="List Bullet")
+    for row_data in batch_rows:
+        rc = t2.add_row().cells
+        vals = (
+            row_data["鋼筋號數"],
+            row_data["斷面積 Ab (cm²)"],
+            row_data["第25章所需埋深"],
+            row_data["第17章高強藥劑埋深"],
+            row_data["檢核判定"],
+            row_data["每公尺雙排替代方案建議"],
+        )
+        for idx, cell in enumerate(rc):
+            cell.text = str(vals[idx])
+
+    # 三、指定號數每公尺寬度換算與配置圖
+    doc.add_heading(f"三、 【{target_rebar} @ {orig_spacing} cm】每公尺寬度替代配筋與鑽孔配置圖", level=2)
+    if per_m_schemes:
+        for i, sc in enumerate(per_m_schemes, 1):
             doc.add_paragraph(
-                f"   • 斷面積檢核：{item['斷面積比']}\n"
-                f"   • 建議植入深度：{item['建議最小埋深']}（依據：{item['適用規範路徑']}）\n"
-                f"   • 施工排列方式：{item['現場配置提醒']}"
+                f"【方案 {i}】{sc['方案名稱']}（每公尺總支數 {sc['total_bars_m']} 支，"
+                f"提供斷面積 {sc['As_new_m']} cm²/m ≥ 原設計 {sc['As_orig_m']} cm²/m [{sc['ratio_pct']}%]，"
+                f"建議植入深度 {sc['rec_depth']} cm，斜向中心距 {sc['diag_spacing']} cm）",
+                style="List Bullet",
             )
+        if fig_buf is not None:
+            fig_buf.seek(0)
+            doc.add_picture(fig_buf, width=Inches(6.2))
+            cap = doc.add_paragraph("圖 1：連續壁每公尺寬度（100 cm）上下雙排梅花錯開鑽孔配置示意圖")
+            cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
     else:
-        doc.add_paragraph("原設計號數已可直接滿足最大深度限制，或現場條件極度嚴苛需改用機械續接器。")
+        doc.add_paragraph(
+            f"目前設定之 {target_rebar} @ {orig_spacing} cm 可直接依原號數與原間距施作，無須拆分為雙排小號數替代。"
+        )
 
     bio = io.BytesIO()
     doc.save(bio)
     bio.seek(0)
     return bio
-
-
 # ==========================================
-# 5. Streamlit 互動介面
+# 6. Streamlit 側邊欄與主畫面互動介面
 # ==========================================
-st.title("🧱 連續壁錯位植筋：雙規範反向檢核與替代方案系統")
-st.markdown(
-    "針對連續壁壁厚與最大鑽孔深度限制，同步反算 **ACI 318 第 25 章（伸展長度法）** 與 **第 17 章（高強度認證藥劑群錨法）** 所需埋深，並自動生成等斷面積替代方案。"
-)
+st.title("🧱 連續壁錯位植筋：批次總表與每公尺雙排配置系統")
 
 with st.sidebar:
-    st.header("🏗️ 1. 連續壁幾何與深度限制")
-    wall_thick = st.number_input(
-        "連續壁設計壁厚 (cm)", min_value=50.0, max_value=200.0, value=100.0, step=5.0
-    )
-    bad_conc_layer = st.number_input(
-        "表面夾泥/劣質混凝土剔除厚度 (cm)", min_value=0.0, max_value=15.0, value=5.0, step=1.0
-    )
-    max_allow_depth = st.number_input(
-        "最大允許有效植入深度上限 (cm)",
-        min_value=15.0,
-        max_value=150.0,
-        value=50.0,
-        step=5.0,
-        help="扣除劣質層後，健全混凝土內允許的最大鑽孔深度",
-    )
-    remain_wall = wall_thick - bad_conc_layer - max_allow_depth
+    st.header("🏗️ 1. 連續壁幾何與深度上限")
+    wall_thick = st.number_input("連續壁設計壁厚 (cm)", 50.0, 200.0, 100.0, 5.0)
+    bad_layer = st.number_input("表面夾泥/劣質層剔除厚度 (cm)", 0.0, 15.0, 5.0, 1.0)
+    max_allow_depth = st.number_input("最大允許有效植入深度上限 (cm)", 15.0, 150.0, 50.0, 5.0)
+    remain_wall = wall_thick - bad_layer - max_allow_depth
     if remain_wall < 15.0:
-        st.error(f"⚠️ 警告：鑽孔後方剩餘阻水壁厚僅 {remain_wall:.1f} cm (< 15 cm)，有湧水風險！")
+        st.error(f"⚠️ 剩餘阻水壁厚僅 {remain_wall:.1f} cm (< 15 cm)！")
     else:
         st.success(f"✅ 鑽孔後方保有 **{remain_wall:.1f} cm** 健全阻水壁厚。")
 
     st.divider()
-    st.header("🔩 2. 原設計錯位鋼筋與間距")
+    st.header("🔩 2. 原設計配筋條件")
     rebar_options = tuple(REBAR_DB.keys())
-    orig_rebar = st.selectbox("原設計預埋鋼筋號數", options=rebar_options, index=4)  # 預設 #8 (D25)
-    orig_spacing = st.number_input(
-        "原設計中心間距 s (cm)", min_value=8.0, max_value=40.0, value=15.0, step=0.5
-    )
+    orig_rebar = st.selectbox("重點檢核鋼筋號數", options=rebar_options, index=4)  # 預設 #8
+    orig_spacing = st.number_input("原設計中心間距 s (cm)", 8.0, 40.0, 15.0, 0.5)
     splice_mode = st.selectbox(
         "植筋接頭受力型式",
         options=("直接延伸作為主筋 (1.0 ld)", "伸出後與既有主筋搭接 (1.3 ld)"),
@@ -284,165 +443,113 @@ with st.sidebar:
     )
 
     st.divider()
-    st.header("🧪 3. 材料與高強度藥劑參數")
+    st.header("🧪 3. 材料與認證藥劑參數")
     fc_options = (210, 245, 280, 350, 420)
     fc = st.selectbox("連續壁混凝土強度 f'c (kgf/cm²)", options=fc_options, index=3)  # 預設 350
-    steel_options = tuple(STEEL_DB.keys())
-    steel_type = st.selectbox("鋼筋材質", options=steel_options, index=0)
-    tau_k = st.number_input(
-        "AC308 認證藥劑特徵黏結應力 τ_k (kgf/cm²)",
-        min_value=40.0,
-        max_value=200.0,
-        value=105.0,
-        step=5.0,
-    )
+    steel_type = st.selectbox("鋼筋材質", options=tuple(STEEL_DB.keys()), index=0)
+    tau_k = st.number_input("AC308 認證藥劑特徵黏結應力 τ_k (kgf/cm²)", 40.0, 200.0, 105.0, 5.0)
 
     st.divider()
-    st.header("🎯 4. 第 17 章反算設計目標")
-    stress_ratio = st.slider(
-        "該斷面實際設計應力比 (Nu / Ab·fy)",
-        min_value=0.50,
-        max_value=1.00,
-        value=1.00,
-        step=0.05,
-        help="1.00 代表要求達到 100% 鋼筋降伏強度；若非最大彎矩區可依結構計算調降至 0.70~0.85",
-    )
-    require_ductile = st.checkbox(
-        "強制滿足延性破壞原則 (混凝土/黏結標稱力 ≥ 1.0 fy)", value=True
-    )
+    st.header("🎯 4. 第 17 章反算目標")
+    stress_ratio = st.slider("實際設計應力比 (Nu / Ab·fy)", 0.50, 1.00, 1.00, 0.05)
+    require_ductile = st.checkbox("強制滿足延性破壞原則 (非鋼材標稱力 ≥ fy)", value=True)
 
-# ==========================================
-# 6. 執行主計算與畫面呈現
-# ==========================================
 db = REBAR_DB[orig_rebar]["db"]
 Ab = REBAR_DB[orig_rebar]["Ab"]
 fy = STEEL_DB[steel_type]["fy"]
 fu = STEEL_DB[steel_type]["fu"]
 is_lap = "1.3" in splice_mode
 
-# 1. 第 25 章反算
-req_d25, conf_val = calc_ch25_required_depth(db, fy, fc, orig_spacing, is_lap)
-d25_ceil = math.ceil(req_d25)
-ok_25 = d25_ceil <= max_allow_depth
-
-# 2. 第 17 章反算
-req_d17, phi_Nn_at_20db, target_Nu, limit_20db = solve_ch17_required_depth(
-    db, Ab, fy, fu, fc, tau_k, orig_spacing, stress_ratio, require_ductile
+# 執行批次運算與每公尺替代運算
+batch_table = run_batch_all_rebars(
+    orig_spacing, max_allow_depth, fy, fu, fc, tau_k, is_lap, stress_ratio, require_ductile
 )
-ok_17 = (req_d17 is not None) and (math.ceil(req_d17) <= max_allow_depth)
+per_m_schemes, bars_orig_m, As_orig_m = calc_per_meter_schemes(
+    orig_rebar,
+    Ab,
+    orig_spacing,
+    max_allow_depth,
+    fy,
+    fu,
+    fc,
+    tau_k,
+    is_lap,
+    stress_ratio,
+    require_ductile,
+)
 
-st.subheader(f"📊 原設計 【{orig_rebar} @ {orig_spacing} cm】 反向埋深檢核結果")
+tab1, tab2 = st.tabs(
+    ["📋 一、 #4 ～ #10 全號數批次計算總表", "📐 二、 每公尺寬度配筋換算與雙排錯開配置圖"]
+)
 
-col1, col2, col3 = st.columns(3)
-with col1:
-    st.metric(
-        "最大允許埋深上限",
-        f"{max_allow_depth:.0f} cm",
-        f"壁厚 {wall_thick:.0f} cm (餘 {remain_wall:.0f} cm)",
+# --- 分頁 1：全號數批次總表 ---
+with tab1:
+    st.subheader(
+        f"📊 #4 ～ #10 全號數反向埋深檢核總表（間距 s = {orig_spacing} cm，上限 {max_allow_depth:.0f} cm）"
+    )
+    st.dataframe(batch_table, width="stretch", hide_index=True)
+    st.caption(
+        "註：表列埋深皆從「敲除表層劣質混凝土後的健全混凝土面」起算；當原號數超過上限時，右側欄位自動帶出最佳每公尺雙排替代配置。"
     )
 
-with col2:
-    st.metric(
-        "第 25 章：伸展長度法所需埋深",
-        f"{d25_ceil} cm",
-        delta="✅ 符合上限" if ok_25 else f"❌ 超出 {d25_ceil - max_allow_depth:.0f} cm",
-        delta_color="normal" if ok_25 else "inverse",
-    )
+# --- 分頁 2：每公尺配筋換算與鑽孔配置圖 ---
+with tab2:
+    st.subheader(f"📐 【{orig_rebar} @ {orig_spacing} cm】每公尺寬度配筋換算與雙排配置圖")
 
-with col3:
-    if req_d17 is not None:
-        d17_ceil = math.ceil(req_d17)
-        st.metric(
-            "第 17 章：高強藥劑法所需埋深",
-            f"{d17_ceil} cm",
-            delta="✅ 符合上限" if ok_17 else f"❌ 超出 {d17_ceil - max_allow_depth:.0f} cm",
-            delta_color="normal" if ok_17 else "inverse",
+    c1, c2, c3 = st.columns(3)
+    c1.metric("原設計每公尺支數", f"{bars_orig_m:.2f} 支/m", f"間距 @ {orig_spacing} cm")
+    c2.metric("原設計每公尺總斷面積 As", f"{As_orig_m:.2f} cm²/m", f"單支 Ab = {Ab} cm²")
+    c3.metric("最大允許鑽孔深度", f"{max_allow_depth:.0f} cm", f"壁厚 {wall_thick:.0f} cm")
+
+    fig_buffer = None
+    if per_m_schemes:
+        scheme_names = tuple(s["方案名稱"] for s in per_m_schemes)
+        selected_name = st.selectbox("選擇要檢視與匯出圖面的替代配置方案：", options=scheme_names)
+        chosen_scheme = next(s for s in per_m_schemes if s["方案名稱"] == selected_name)
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("替代方案每公尺總支數", f"{chosen_scheme['total_bars_m']} 支/m", "上下雙排各半")
+        m2.metric(
+            "單排水平中心距",
+            f"{chosen_scheme['s_each_row']} cm",
+            f"垂直排距 {chosen_scheme['row_gap']:.0f} cm",
         )
+        m3.metric("梅花錯開斜向中心距", f"{chosen_scheme['diag_spacing']} cm", "確保 ≥ 10 cm 圍束")
+        m4.metric(
+            "提供總斷面積 As,new",
+            f"{chosen_scheme['As_new_m']} cm²/m",
+            f"達原設計 {chosen_scheme['ratio_pct']}%",
+        )
+
+        st.markdown("#### 🖼️ 連續壁每公尺寬度（100 cm）雙排梅花錯開鑽孔配置圖")
+        fig_buffer = plot_staggered_layout(orig_rebar, orig_spacing, chosen_scheme)
+        st.image(fig_buffer, width="content")
     else:
-        st.metric(
-            "第 17 章：高強藥劑法所需埋深",
-            "無法達成 (群組錐裂控制)",
-            delta=f"20db 極限僅 {phi_Nn_at_20db:,.0f} kgf",
-            delta_color="inverse",
-        )
-# 判定總結與原因解析
-st.divider()
-alt_schemes = []
-
-if ok_25 or ok_17:
-    st.success("🎉 **檢核結論：原設計鋼筋號數可直接施工！**")
-    if ok_25 and ok_17:
-        rec_final = min(d25_ceil, math.ceil(req_d17))
-        st.write(
-            f"- 同時符合第 25 章（{d25_ceil} cm）與第 17 章（{math.ceil(req_d17)} cm），建議現場採用較經濟且安全之深度 **{max(rec_final, 30)} cm**（由健全混凝土面起算）。"
-        )
-    elif ok_17:
-        st.write(
-            f"- 雖然第 25 章伸展長度需 **{d25_ceil} cm**（超過上限），但改採 **ACI 318 第 17 章 + 高強度 AC308 認證純環氧樹脂（τ_k = {tau_k} kgf/cm²）** 後，所需埋深可合法縮短至 **{math.ceil(req_d17)} cm**（≤ {max_allow_depth:.0f} cm），可直接依原號數施工！"
-        )
-    else:
-        st.write(
-            f"- 依第 25 章計算所需伸展長度為 **{d25_ceil} cm**（≤ {max_allow_depth:.0f} cm），可直接依原號數施工。"
-        )
-else:
-    st.error(
-        f"🚨 **檢核結論：原設計 {orig_rebar} @ {orig_spacing} cm 在 {max_allow_depth:.0f} cm 埋深限制下【無法達標】！**"
-    )
-    st.write(
-        f"- **原因分析**：在間距 {orig_spacing} cm 緊密排列下，第 25 章伸展長度需 **{d25_ceil} cm**；而第 17 章即使採用高強度藥劑（τ_k={tau_k}），在 20db ({limit_20db:.1f} cm) 埋深下受限於「整排群組混凝土錐狀破裂重疊折減」，單支設計容量僅 **{phi_Nn_at_20db:,.0f} kgf**（低於目標需求 **{target_Nu:,.0f} kgf**）。"
-    )
-
-    # 自動生成替代方案
-    st.subheader("💡 系統自動生成：等斷面積替代方案（符合 ≤ 50 cm 限制）")
-    alt_schemes = find_alternative_schemes(
-        orig_rebar,
-        Ab,
-        orig_spacing,
-        max_allow_depth,
-        fy,
-        fu,
-        fc,
-        tau_k,
-        is_lap,
-        stress_ratio,
-        require_ductile,
-    )
-    if alt_schemes:
-        st.table(alt_schemes)
-    else:
-        st.warning(
-            "在目前極小間距與嚴苛應力條件下，即使降號數加密仍受限於群組錐裂，建議：(1) 調降非塑鉸區實際應力比；(2) 增加允許鑽孔深度；或 (3) 局部敲除連續壁保護層露出既有主筋採機械續接。"
+        st.info(
+            f"💡 目前條件下，原設計 **{orig_rebar} @ {orig_spacing} cm** 可直接施作（或無須拆分為更小號數雙排），若仍想強制查看小號數雙排配置，可嘗試將左側「重點檢核鋼筋號數」調大為 **#8、#9 或 #10**。"
         )
 
 # ==========================================
-# 7. Word 計算書匯出
+# 7. Word 計算書一鍵匯出 (含總表 + 配置圖)
 # ==========================================
 st.divider()
-st.subheader("📄 匯出連續壁替代方案計算書 (Word)")
+st.subheader("📄 匯出完整結構計算書 (含 #4～#10 總表與鑽孔配置圖)")
 
-inputs_summary = {
-    "連續壁幾何條件": f"壁厚 {wall_thick:.0f} cm，剔除表層劣質混凝土 {bad_conc_layer:.0f} cm，最大允許埋深 {max_allow_depth:.0f} cm",
-    "原設計錯位鋼筋": f"{orig_rebar} (db={db} cm, Ab={Ab} cm²)，中心間距 s = {orig_spacing} cm",
-    "材料與藥劑參數": f"f'c = {fc} kgf/cm²，{steel_type}，AC308 藥劑 τ_k = {tau_k} kgf/cm²",
+inputs_doc = {
+    "連續壁幾何與深度限制": f"壁厚 {wall_thick:.0f} cm，剔除表層劣質混凝土 {bad_layer:.0f} cm，最大允許埋深 {max_allow_depth:.0f} cm",
+    "重點檢核配筋": f"{orig_rebar} @ {orig_spacing} cm (每公尺 {bars_orig_m:.2f} 支，As = {As_orig_m:.2f} cm²/m)",
+    "材料與認證藥劑": f"f'c = {fc} kgf/cm²，{steel_type}，AC308 藥劑 τ_k = {tau_k} kgf/cm²",
     "受力與延性條件": f"{splice_mode}，設計應力比 = {stress_ratio:.2f}，延性檢核 = {'開啟' if require_ductile else '關閉'}",
 }
 
-results_summary = {
-    "第 25 章伸展長度法反算": f"所需埋深 {d25_ceil} cm ({'合格' if ok_25 else '超過上限'})",
-    "第 17 章高強藥劑法反算": (
-        f"所需埋深 {math.ceil(req_d17)} cm ({'合格' if ok_17 else '超過上限'})"
-        if req_d17 is not None
-        else f"群組錐裂控制，20db 深度下僅達 {phi_Nn_at_20db:,.0f} kgf (< 需求 {target_Nu:,.0f} kgf)"
-    ),
-    "最終工程判定": "原號數可直接施作" if (ok_25 or ok_17) else "原號數超限，須採用下方替代方案",
-}
-
-word_file = build_word_doc(inputs_summary, results_summary, alt_schemes)
+word_bytes = build_comprehensive_word_doc(
+    inputs_doc, batch_table, orig_rebar, orig_spacing, per_m_schemes, fig_buffer
+)
 rebar_clean = next(iter(orig_rebar.split()))
 
 st.download_button(
-    label="⬇️ 下載連續壁植筋反算與替代方案計算書 (.docx)",
-    data=word_file,
-    file_name=f"連續壁植筋反算_{rebar_clean}_fc{fc}_{datetime.now().strftime('%Y%m%d')}.docx",
+    label="⬇️ 下載完整 Word 計算書 (.docx) [含全號數總表 & 配置圖]",
+    data=word_bytes,
+    file_name=f"連續壁植筋批次總表與雙排配置_{rebar_clean}_fc{fc}_{datetime.now().strftime('%Y%m%d')}.docx",
     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-)        
+)
