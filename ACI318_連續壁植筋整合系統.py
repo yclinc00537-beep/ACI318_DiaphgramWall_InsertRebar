@@ -12,19 +12,20 @@ import streamlit as st
 # 1. 頁面設定與工程資料庫
 # ==========================================
 st.set_page_config(
-    page_title="ACI 318 連續壁植筋：雙軌物理修正、批次總表與雙排配置系統",
+    page_title="ACI 318 連續壁植筋：全功能結構設計與施工品管系統",
     page_icon="🧱",
     layout="wide",
 )
 
+# 鋼筋資料庫 (號數: {直徑 db cm, 斷面積 Ab cm2, 標準鑽孔直徑 d0 cm})
 REBAR_DB = {
-    "#4 (D13)": {"db": 1.27, "Ab": 1.267},
-    "#5 (D16)": {"db": 1.59, "Ab": 1.986},
-    "#6 (D19)": {"db": 1.91, "Ab": 2.865},
-    "#7 (D22)": {"db": 2.22, "Ab": 3.871},
-    "#8 (D25)": {"db": 2.54, "Ab": 5.067},
-    "#9 (D29)": {"db": 2.87, "Ab": 6.469},
-    "#10 (D32)": {"db": 3.22, "Ab": 8.143},
+    "#4 (D13)": {"db": 1.27, "Ab": 1.267, "d0": 1.6},
+    "#5 (D16)": {"db": 1.59, "Ab": 1.986, "d0": 2.0},
+    "#6 (D19)": {"db": 1.91, "Ab": 2.865, "d0": 2.5},
+    "#7 (D22)": {"db": 2.22, "Ab": 3.871, "d0": 2.8},
+    "#8 (D25)": {"db": 2.54, "Ab": 5.067, "d0": 3.2},
+    "#9 (D29)": {"db": 2.87, "Ab": 6.469, "d0": 3.5},
+    "#10 (D32)": {"db": 3.22, "Ab": 8.143, "d0": 4.0},
 }
 
 STEEL_DB = {
@@ -58,18 +59,15 @@ ADHESIVE_CASE_DB = {
 
 
 # ==========================================
-# 2. 核心雙軌物理修正計算引擎
+# 2. 核心雙軌物理修正計算引擎 & 壁外伸出長度計算
 # ==========================================
 def calc_ch25_with_bond_physics(db, fy, fc, spacing_s, edge_c, tau_k, is_lap):
-    """計算第 25 章伸展長度，並納入低黏結放大與混凝土劈裂上限 (Cap=1.0) 物理修正"""
     cb = min(edge_c, max((spacing_s - db) / 2.0, 1.0 * db))
     confinement = min(cb / db, 2.5)
     psi_s = 0.8 if db <= 1.91 else 1.0
     psi_g = 1.0 if fy <= 4200 else 1.15
 
-    # 預埋竹節鋼筋等效基準握裹應力 f_bd,ref (kgf/cm2)
     fbd_ref = 4.5 * math.sqrt(fc)
-    # 低黏結藥劑按比例放大；高黏結藥劑受混凝土保護層抗劈裂強度上限控制，鎖定為 1.0
     alpha_bond = max(1.0, fbd_ref / tau_k)
 
     ld_base = (0.28 * fy / math.sqrt(fc)) * ((1.0 * 1.0 * psi_s * psi_g) / confinement) * db
@@ -78,12 +76,40 @@ def calc_ch25_with_bond_physics(db, fy, fc, spacing_s, edge_c, tau_k, is_lap):
     return req_depth, fbd_ref, alpha_bond
 
 
+def calc_exterior_lap_and_hook(db, fy, fc_new_slab, spacing_s, cover_new=4.0):
+    """計算伸出連續壁外之直線搭接長度、標準彎鉤長度及 SA 級摩擦焊續接器最短預留長度"""
+    cb = min(cover_new + db / 2.0, spacing_s / 2.0)
+    confinement = min(cb / db, 2.5)
+    psi_s = 0.8 if db <= 1.91 else 1.0
+    psi_g = 1.0 if fy <= 4200 else 1.15
+
+    ld_bot_raw = (0.28 * fy / math.sqrt(fc_new_slab)) * ((1.0 * psi_s * psi_g) / confinement) * db
+    ld_bot = max(ld_bot_raw, 30.0)
+    lap_bot = math.ceil(1.3 * ld_bot)
+
+    ld_top = max(ld_bot_raw * 1.3, 30.0)
+    lap_top = math.ceil(1.3 * ld_top)
+
+    ldh_raw = (0.075 * fy / math.sqrt(fc_new_slab)) * db
+    ldh = math.ceil(max(ldh_raw, 8.0 * db, 15.0))
+
+    # SA 級機械續接器 (現場摩擦焊)：夾持操作空間 + 套筒半長 + 植筋膠高溫隔熱緩衝 >= max(8*db, 15 cm)
+    sa_coupler_min = math.ceil(max(8.0 * db, 15.0))
+
+    return {
+        "ld_bot": math.ceil(ld_bot),
+        "lap_bot": lap_bot,
+        "ld_top": math.ceil(ld_top),
+        "lap_top": lap_top,
+        "ldh": ldh,
+        "sa_coupler": sa_coupler_min,
+    }
+
+
 def calc_ch17_row_capacity(hef, db, Ab, fy, fu, fc, tau_k, spacing_s, edge_c, n_row=10):
-    """計算連續壁整排植筋在指定埋深 hef 下的單支平均設計抗拉強度與控制破壞模式"""
     futa = min(fu, 1.9 * fy, 8800.0)
     phi_Nsa = 0.75 * (Ab * futa)
 
-    # 1. 群組混凝土錐狀破裂 Ncbg
     Nb = 16.0 * math.sqrt(fc) * (hef**1.5)
     ANco = 9.0 * (hef**2)
     bx = (n_row - 1) * min(spacing_s, 3.0 * hef) + 3.0 * hef
@@ -93,7 +119,6 @@ def calc_ch17_row_capacity(hef, db, Ab, fy, fu, fc, tau_k, spacing_s, edge_c, n_
     Ncbg_per_bar = ((ANc / ANco) * psi_ed_N * Nb) / n_row
     phi_Ncb_per_bar = 0.65 * Ncbg_per_bar
 
-    # 2. 群組化學黏結強度 Nag
     Nba = tau_k * math.pi * db * hef
     cNa = 10.0 * db * math.sqrt(tau_k / 77.3)
     ANao = (2.0 * cNa) ** 2
@@ -113,7 +138,6 @@ def calc_ch17_row_capacity(hef, db, Ab, fy, fu, fc, tau_k, spacing_s, edge_c, n_
 def solve_ch17_parallel_depth(
     db, Ab, fy, fu, fc, tau_k, spacing_s, edge_c, stress_ratio, require_ductile
 ):
-    """不設 20db 強制分流，反向二分搜尋第 17 章所需最小埋深並標示控制破壞模式"""
     target_Nu = (Ab * fy) * stress_ratio
     low = 4.0 * db
     high = 60.0 * db
@@ -142,7 +166,44 @@ def solve_ch17_parallel_depth(
 
 
 # ==========================================
-# 3. 每公尺寬度配筋換算 & 雙排梅花錯開配置圖
+# 3. 注膠量估算 & 現場拉拔試驗驗收標準計算
+# ==========================================
+def calc_grout_and_pullout_qa(
+    rebar_key, hef_cm, total_bars_job, cartridge_ml, waste_pct, fy, stress_ratio
+):
+    db = REBAR_DB[rebar_key]["db"]
+    Ab = REBAR_DB[rebar_key]["Ab"]
+    d0 = REBAR_DB[rebar_key]["d0"]
+
+    # 1. 單孔理論環狀注膠體積 (cm3 = ml) 與含損耗體積
+    vol_net_ml = (math.pi / 4.0) * (d0**2 - db**2) * hef_cm
+    vol_gross_ml = vol_net_ml * (1.0 + waste_pct / 100.0)
+    total_vol_ml = vol_gross_ml * total_bars_job
+    cartridges_needed = math.ceil(total_vol_ml / cartridge_ml)
+
+    # 2. 現場非破壞拉拔試驗 (Proof Load) 驗收標準
+    yield_load_kgf = Ab * fy
+    design_load_kgf = yield_load_kgf * stress_ratio
+    # 試驗拉力取 1.25 倍設計拉力，但上限不得超過鋼筋降伏力之 80% (防止鋼筋降伏變形)
+    proof_load_kgf = min(1.25 * design_load_kgf, 0.80 * yield_load_kgf)
+    # 抽驗支數：總支數 5% 且不少於 3 支 (若總支數 < 3 則全檢)
+    sample_count = min(total_bars_job, max(3, math.ceil(total_bars_job * 0.05)))
+
+    return {
+        "d0_mm": int(round(d0 * 10)),
+        "vol_net_ml": round(vol_net_ml, 1),
+        "vol_gross_ml": round(vol_gross_ml, 1),
+        "total_vol_ml": round(total_vol_ml, 0),
+        "cartridges_needed": cartridges_needed,
+        "yield_load_kgf": round(yield_load_kgf, 0),
+        "design_load_kgf": round(design_load_kgf, 0),
+        "proof_load_kgf": round(proof_load_kgf, 0),
+        "sample_count": sample_count,
+    }
+
+
+# ==========================================
+# 4. 每公尺寬度配筋換算 & 雙排梅花錯開配置圖
 # ==========================================
 def calc_per_meter_schemes(
     orig_rebar_key,
@@ -159,7 +220,6 @@ def calc_per_meter_schemes(
     stress_ratio,
     require_ductile,
 ):
-    """計算每 100 cm 寬度總斷面積，並搜尋符合雙軌物理修正且 <= 最大允許埋深的雙排替代方案"""
     bars_per_m_orig = 100.0 / orig_spacing
     As_per_m_orig = bars_per_m_orig * orig_Ab
 
@@ -216,8 +276,6 @@ def calc_per_meter_schemes(
                         "As_new_m": round(As_new_m, 2),
                         "ratio_pct": round(As_new_m / As_per_m_orig * 100, 1),
                         "rec_depth": max(rec_depth, 30),
-                        "d25_val": d25,
-                        "d17_val": d17,
                         "method": method_note,
                     }
                 )
@@ -227,7 +285,6 @@ def calc_per_meter_schemes(
 
 
 def plot_staggered_layout(orig_rebar, orig_spacing, scheme):
-    """繪製連續壁每公尺寬度 (100 cm) 雙排梅花錯開鑽孔配置示意圖"""
     fig, ax = plt.subplots(figsize=(8.8, 3.8), dpi=150)
 
     wall_rect = patches.Rectangle(
@@ -235,7 +292,6 @@ def plot_staggered_layout(orig_rebar, orig_spacing, scheme):
     )
     ax.add_patch(wall_rect)
 
-    # 原設計錯位主筋位置 (灰色虛線圈)
     n_orig = int(100 // orig_spacing) + 1
     for i in range(n_orig):
         xo = i * orig_spacing + (orig_spacing / 2.0)
@@ -267,7 +323,6 @@ def plot_staggered_layout(orig_rebar, orig_spacing, scheme):
         ax.add_patch(patches.Circle((x_curr_b, y_bot), radius=r_bar, color="#2563EB", zorder=4))
         x_curr_b += s_row
 
-    # 標註單排水平中心距
     if len(top_xs) >= 2:
         x1 = next(iter(top_xs))
         x2 = x1 + s_row
@@ -288,7 +343,6 @@ def plot_staggered_layout(orig_rebar, orig_spacing, scheme):
             fontweight="bold",
         )
 
-    # 標註斜向中心距與垂直排距
     if len(top_xs) >= 1 and len(bot_xs) >= 1:
         xt0 = next(iter(top_xs))
         xb0 = next(iter(bot_xs))
@@ -335,7 +389,7 @@ def plot_staggered_layout(orig_rebar, orig_spacing, scheme):
 
 
 # ==========================================
-# 4. #4 ～ #10 全號數批次計算與空間幾何檢核
+# 5. #4 ～ #10 全號數批次計算與空間幾何檢核
 # ==========================================
 def run_batch_all_rebars(
     spacing_s,
@@ -345,6 +399,7 @@ def run_batch_all_rebars(
     fy,
     fu,
     fc,
+    fc_slab,
     tau_k,
     is_lap,
     stress_ratio,
@@ -361,18 +416,19 @@ def run_batch_all_rebars(
         d17, _, _, _, gov_17 = solve_ch17_parallel_depth(
             r_db, r_Ab, fy, fu, fc, tau_k, spacing_s, edge_c, stress_ratio, require_ductile
         )
+        ext_info = calc_exterior_lap_and_hook(r_db, fy, fc_slab, spacing_s)
 
-        d17_str = f"{d17} cm ({gov_17})" if d17 is not None else "無法收斂 (群組錐裂)"
+        d17_str = f"{d17} cm ({gov_17})" if d17 is not None else "群組錐裂超限"
         ok25 = d25 <= max_allow_depth
         ok17 = (d17 is not None) and (d17 <= max_allow_depth)
 
         if ok25 or ok17:
             best_d = min(d25 if ok25 else 999, d17 if ok17 else 999)
             ctrl_src = "第17章" if (ok17 and (not ok25 or d17 <= d25)) else "第25章"
-            status = f"✅ 合格 (建議 {max(best_d, 30)} cm / {ctrl_src})"
+            status = f"✅ 合格 ({max(best_d, 30)} cm / {ctrl_src})"
             alt_text = "原號數可直接施作"
         else:
-            status = f"❌ 超過 {max_allow_depth:.0f} cm 上限"
+            status = f"❌ 超過 {max_allow_depth:.0f} cm"
             sub_schemes, _, _ = calc_per_meter_schemes(
                 r_key,
                 r_Ab,
@@ -392,70 +448,98 @@ def run_batch_all_rebars(
                 top_s = next(iter(sub_schemes))
                 alt_text = f"{top_s['方案名稱']} (埋深 {top_s['rec_depth']} cm)"
             else:
-                alt_text = "需加大間距/排距或採機械續接"
+                alt_text = "需加大間距或採機械續接"
 
         batch_rows.append(
             {
                 "鋼筋號數": r_key,
-                "斷面積 Ab": f"{r_Ab:.3f} cm²",
-                "第25章埋深 (含α_bond)": f"{d25} cm (α={alpha_b:.2f})",
-                "第17章錨定埋深": d17_str,
-                "檢核結論": status,
-                "每公尺雙排替代方案建議": alt_text,
+                "壁內第25章埋深": f"{d25} cm (α={alpha_b:.2f})",
+                "壁內第17章埋深": d17_str,
+                "壁外直線搭接(下/上)": f"{ext_info['lap_bot']} / {ext_info['lap_top']} cm",
+                "壁外彎鉤 ldh": f"{ext_info['ldh']} cm",
+                "SA級摩擦焊預留": f"{ext_info['sa_coupler']} cm",
+                "壁內檢核結論": status,
+                "每公尺雙排替代方案": alt_text,
             }
         )
     return batch_rows
 
 
-def build_geometry_check_rows(db, sx, sy, edge_c, hef_ref, cNa):
-    min_struct = round(max(6.0 * db, 10.0), 1)
+def build_geometry_check_rows(db, sx, sy, edge_c, hef_ref, cNa, d_agg=2.0):
+    min_clear_cast_in = round(max(2.5, db, (4.0 / 3.0) * d_agg), 2)
+    min_center_cast_in = round(min_clear_cast_in + db, 2)
+    min_center_post_5db = round(max(5.0 * db, 10.0), 1)
+    min_center_post_6db = round(max(6.0 * db, 10.0), 1)
+
     crit_s = round(max(3.0 * hef_ref, 2.0 * cNa), 1)
     crit_e = round(max(1.5 * hef_ref, cNa), 1)
 
-    def eval_item(val, crit_val, label_over):
-        if val >= crit_val:
-            return "✅ 達無折減臨界距離"
-        elif val >= min_struct:
-            return f"⚠️ 合格 ({label_over})"
+    clear_sx = round(sx - db, 2)
+    clear_sy = round(sy - db, 2)
+
+    def eval_spacing(center_val, clear_val, label_over):
+        if center_val >= crit_s:
+            return "✅ 達無折減臨界距離 (100%強度)"
+        elif center_val >= min_center_post_6db:
+            return f"⚠️ 合格 ({label_over}；淨距 {clear_val} cm ≥ 預埋下限 {min_clear_cast_in} cm)"
+        elif center_val >= min_center_post_5db:
+            return f"⚠️ 警戒 (介於 5db~6db 鑽孔極限；{label_over})"
+        elif clear_val >= min_clear_cast_in:
+            return f"❌ 鑽孔過密 (< 植筋下限 {min_center_post_5db} cm，易震碎孔壁)"
         else:
-            return f"❌ 違規 (< 構造下限 {min_struct} cm)"
+            return f"❌ 雙重違規 (同時小於預埋淨距 {min_clear_cast_in} cm 與植筋中心距 {min_center_post_5db} cm)"
+
+    def eval_edge(edge_val):
+        if edge_val >= crit_e:
+            return "✅ 達無折減臨界邊距"
+        elif edge_val >= min_center_post_6db:
+            return "⚠️ 合格 (已計入邊距折減 ψ_ed)"
+        else:
+            return f"❌ 違規 (< 植筋最小邊距下限 {min_center_post_6db} cm)"
 
     return [
         {
             "幾何項目": "X 向水平中心間距 (sx)",
-            "設定數值": f"{sx} cm ({sx/db:.1f} db)",
-            "構造最小下限": f"{min_struct} cm (max 6db, 10cm)",
+            "設定數值 (中心 / 淨距)": f"{sx} cm / 淨距 {clear_sx} cm",
+            "預埋鋼筋下限 (25.2節)": f"淨距 ≥ {min_clear_cast_in} cm (中心 {min_center_cast_in} cm)",
+            "後置植筋鑽孔下限 (AC308)": f"中心 ≥ {min_center_post_5db} ~ {min_center_post_6db} cm (5db~6db)",
             "無折減臨界距離": f"{crit_s} cm (max 3hef, 2cNa)",
-            "判定狀態": eval_item(sx, crit_s, "已計入群組投影折減"),
+            "雙重標準判定狀態": eval_spacing(sx, clear_sx, "已計入群組投影折減"),
         },
         {
             "幾何項目": "Y 向雙排垂直排距 (sy)",
-            "設定數值": f"{sy} cm ({sy/db:.1f} db)",
-            "構造最小下限": f"{min_struct} cm (max 6db, 10cm)",
+            "設定數值 (中心 / 淨距)": f"{sy} cm / 淨距 {clear_sy} cm",
+            "預埋鋼筋下限 (25.2節)": f"淨距 ≥ {min_clear_cast_in} cm (中心 {min_center_cast_in} cm)",
+            "後置植筋鑽孔下限 (AC308)": f"中心 ≥ {min_center_post_5db} ~ {min_center_post_6db} cm (5db~6db)",
             "無折減臨界距離": f"{crit_s} cm (max 3hef, 2cNa)",
-            "判定狀態": eval_item(sy, crit_s, "雙排錯開需檢核斜向距"),
+            "雙重標準判定狀態": eval_spacing(sy, clear_sy, "雙排錯開需檢核斜向距"),
         },
         {
             "幾何項目": "最小自由邊距 (Edge c_a,min)",
-            "設定數值": f"{edge_c} cm ({edge_c/db:.1f} db)",
-            "構造最小下限": f"{min_struct} cm (max 6db, 10cm)",
+            "設定數值 (中心 / 淨距)": f"{edge_c} cm / 淨保護層 {round(edge_c - db/2, 2)} cm",
+            "預埋鋼筋下限 (25.2節)": "淨保護層 ≥ 4.0 ~ 7.5 cm (依環境條件)",
+            "後置植筋鑽孔下限 (AC308)": f"中心 ≥ {min_center_post_6db} cm (max 6db, 10cm)",
             "無折減臨界距離": f"{crit_e} cm (max 1.5hef, cNa)",
-            "判定狀態": eval_item(edge_c, crit_e, "已計入邊距折減 ψ_ed"),
+            "雙重標準判定狀態": eval_edge(edge_c),
         },
     ]
-
-
 # ==========================================
-# 5. Word 完整計算書產生函數
+# 6. Word 完整計算書產生函數
 # ==========================================
 def build_full_word_report(
     inputs_dict,
     batch_rows,
     target_rebar,
     orig_spacing,
+    ext_dict,
     per_m_schemes,
     fig_buf,
     geom_rows,
+    qa_dict,
+    qa_rebar_label,
+    qa_hef,
+    qa_total_bars,
+    cartridge_ml,
     adhesive_msg,
 ):
     doc = Document()
@@ -463,7 +547,7 @@ def build_full_word_report(
     style.font.name = "Microsoft JhengHei"
     style.font.size = Pt(9.5)
 
-    title = doc.add_heading("ACI 318 連續壁植筋：雙軌物理修正、批次總表與雙排配置計算書", level=1)
+    title = doc.add_heading("ACI 318 連續壁植筋：結構設計、壁外搭接與施工品管計算書", level=1)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
     p_meta = doc.add_paragraph(
@@ -471,7 +555,7 @@ def build_full_word_report(
     )
     p_meta.alignment = WD_ALIGN_PARAGRAPH.RIGHT
 
-    doc.add_heading("一、 連續壁工程條件、物理修正參數與藥劑審查", level=2)
+    doc.add_heading("一、 連續壁工程條件與藥劑合規審查", level=2)
     t1 = doc.add_table(rows=1, cols=2)
     t1.style = "Table Grid"
     for idx, cell in enumerate(next(iter(t1.rows)).cells):
@@ -480,11 +564,10 @@ def build_full_word_report(
         rc = t1.add_row().cells
         for idx, cell in enumerate(rc):
             cell.text = str(k) if idx == 0 else str(v)
-
     doc.add_paragraph(f"• 工程 Case 黏著力合規審查：{adhesive_msg}")
 
-    doc.add_heading("二、 #4 ～ #10 全號數雙軌埋深檢核總表", level=2)
-    b_headers = ("鋼筋號數", "斷面積 Ab", "第25章埋深", "第17章埋深", "檢核結論", "每公尺雙排替代方案")
+    doc.add_heading("二、 #4 ～ #10 全號數壁內埋深與壁外伸出長度總表", level=2)
+    b_headers = ("鋼筋號數", "壁內第25章", "壁內第17章", "壁外搭接(下/上)", "彎鉤 ldh", "SA級摩擦焊", "結論", "雙排替代方案")
     t2 = doc.add_table(rows=1, cols=len(b_headers))
     t2.style = "Table Grid"
     for idx, cell in enumerate(next(iter(t2.rows)).cells):
@@ -494,22 +577,32 @@ def build_full_word_report(
         rc = t2.add_row().cells
         vals = (
             r_data["鋼筋號數"],
-            r_data["斷面積 Ab"],
-            r_data["第25章埋深 (含α_bond)"],
-            r_data["第17章錨定埋深"],
-            r_data["檢核結論"],
-            r_data["每公尺雙排替代方案建議"],
+            r_data["壁內第25章埋深"],
+            r_data["壁內第17章埋深"],
+            r_data["壁外直線搭接(下/上)"],
+            r_data["壁外彎鉤 ldh"],
+            r_data["SA級摩擦焊預留"],
+            r_data["壁內檢核結論"],
+            r_data["每公尺雙排替代方案"],
         )
         for idx, cell in enumerate(rc):
             cell.text = str(vals[idx])
 
-    doc.add_heading(f"三、 【{target_rebar} @ {orig_spacing} cm】每公尺寬度替代配筋與雙排配置圖", level=2)
+    doc.add_heading(f"三、 【{target_rebar} @ {orig_spacing} cm】壁外搭接、SA級續接與雙排配置圖", level=2)
+    doc.add_paragraph(
+        f"• 壁外新澆置梁版內伸出長度（{target_rebar}）：\n"
+        f"  1. 下層主筋（ψt=1.0）：基本伸展 ld = {ext_dict['ld_bot']} cm，B 級受拉搭接長度 = {ext_dict['lap_bot']} cm。\n"
+        f"  2. 上層主筋（ψt=1.3，下方新混凝土 > 30cm）：伸展 ld = {ext_dict['ld_top']} cm，B 級受拉搭接長度 = {ext_dict['lap_top']} cm。\n"
+        f"  3. 若壁外寬度受限改採 90°/180° 標準彎鉤錨定：最小彎鉤伸展長度 ldh = {ext_dict['ldh']} cm。\n"
+        f"  4. 若改採 SA 級機械續接器（現場摩擦焊）：壁外最短預留鋼筋長度 = {ext_dict['sa_coupler']} cm（含焊機夾持空間與隔熱緩衝；施焊時植筋根部須包裹濕布或冷卻銅塊，防止高溫傳導損及植筋膠）。"
+    )
+
     if per_m_schemes:
         for i, sc in enumerate(per_m_schemes, 1):
             doc.add_paragraph(
-                f"【方案 {i}】{sc['方案名稱']}（每公尺總支數 {sc['total_bars_m']} 支，"
+                f"【雙排替代方案 {i}】{sc['方案名稱']}（每公尺 {sc['total_bars_m']} 支，"
                 f"提供斷面積 {sc['As_new_m']} cm²/m ≥ 原設計 {sc['As_orig_m']} cm²/m [{sc['ratio_pct']}%]，"
-                f"建議植入深度 {sc['rec_depth']} cm，斜向中心距 {sc['diag_spacing']} cm，依據：{sc['method']}）",
+                f"壁內植入深度 {sc['rec_depth']} cm，斜向中心距 {sc['diag_spacing']} cm）",
                 style="List Bullet",
             )
         if fig_buf is not None:
@@ -518,30 +611,55 @@ def build_full_word_report(
             cap = doc.add_paragraph("圖 1：連續壁每公尺寬度（100 cm）上下雙排梅花錯開鑽孔配置示意圖")
             cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
     else:
-        doc.add_paragraph(
-            f"目前設定之 {target_rebar} @ {orig_spacing} cm 可直接依原號數施作，無須拆分為雙排小號數替代。"
-        )
+        doc.add_paragraph(f"目前設定之 {target_rebar} @ {orig_spacing} cm 可直接依原號數施作，無須雙排替代。")
 
     doc.add_heading("四、 X、Y 間距與 Edge 邊距空間限制檢核", level=2)
-    g_headers = ("幾何項目", "設定數值", "構造最小下限", "無折減臨界距離", "判定狀態")
+    g_headers = ("幾何項目", "設定數值", "預埋鋼筋下限", "後置植筋下限", "無折減臨界距離", "雙重標準判定")
     t3 = doc.add_table(rows=1, cols=len(g_headers))
     t3.style = "Table Grid"
     for idx, cell in enumerate(next(iter(t3.rows)).cells):
         cell.text = g_headers[idx]
     for gr in geom_rows:
         rc = t3.add_row().cells
-        vals = (gr["幾何項目"], gr["設定數值"], gr["構造最小下限"], gr["無折減臨界距離"], gr["判定狀態"])
+        vals = (
+            gr["幾何項目"],
+            gr["設定數值 (中心 / 淨距)"],
+            gr["預埋鋼筋下限 (25.2節)"],
+            gr["後置植筋鑽孔下限 (AC308)"],
+            gr["無折減臨界距離"],
+            gr["雙重標準判定狀態"],
+        )
         for idx, cell in enumerate(rc):
             cell.text = str(vals[idx])
+
+    doc.add_heading("五、 植筋膠用量估算與現場非破壞拉拔試驗驗收標準", level=2)
+    qa_map = {
+        "施工計算基準規格": f"{qa_rebar_label}，標準鑽孔直徑 d0 = {qa_dict['d0_mm']} mm，有效埋深 hef = {qa_hef} cm",
+        "施工總支數與單孔注膠量": f"總計 {qa_total_bars} 支；單孔淨體積 {qa_dict['vol_net_ml']} ml（含損耗 {qa_dict['vol_gross_ml']} ml/孔）",
+        "植筋膠總需求量估算": f"總用膠量約 {qa_dict['total_vol_ml']:,.0f} ml ➔ 建議備料 {qa_dict['cartridges_needed']} 支（每支 {cartridge_ml} ml）",
+        "現場拉拔抽驗支數規定": f"依規範抽驗 5%（且不少於 3 支）➔ 本批至少抽驗 {qa_dict['sample_count']} 支",
+        "現場試驗拉力 (Proof Load)": f"{qa_dict['proof_load_kgf']:,.0f} kgf / 支（取 1.25 倍設計拉力，並以 0.80 Ab·fy = {0.8*qa_dict['yield_load_kgf']:,.0f} kgf 為上限）",
+        "現場試驗合格判定基準": "加載至試驗拉力持荷 2 分鐘，植筋膠無滑移剝離、混凝土無放射狀開裂、鋼筋無降伏變形即為合格。",
+    }
+    t4 = doc.add_table(rows=1, cols=2)
+    t4.style = "Table Grid"
+    for idx, cell in enumerate(next(iter(t4.rows)).cells):
+        cell.text = "品管與備料項目" if idx == 0 else "計算數值與驗收標準"
+    for k, v in qa_map.items():
+        rc = t4.add_row().cells
+        for idx, cell in enumerate(rc):
+            cell.text = str(k) if idx == 0 else str(v)
 
     bio = io.BytesIO()
     doc.save(bio)
     bio.seek(0)
     return bio
+
+
 # ==========================================
-# 6. Streamlit 側邊欄與主畫面介面
+# 7. Streamlit 側邊欄與主畫面介面
 # ==========================================
-st.title("🧱 連續壁錯位植筋：雙軌物理修正、批次總表與雙排配置系統")
+st.title("🧱 連續壁錯位植筋：全功能結構設計與施工品管系統")
 
 with st.sidebar:
     st.header("🏗️ 1. 連續壁幾何與深度上限")
@@ -567,18 +685,26 @@ with st.sidebar:
     row_vertical_gap = st.number_input("雙排錯開垂直排距 sy (cm)", 6.0, 30.0, 10.0, 0.5)
     edge_c = st.number_input("最小自由邊距 Edge c_a,min (cm)", 5.0, 150.0, 20.0, 1.0)
     splice_mode = st.selectbox(
-        "伸展植筋接頭受力型式",
+        "壁內伸展植筋受力型式",
         options=("壁內直接延伸作為主筋 (1.0 ld)", "壁邊直接與主筋重疊搭接 (1.3 ld)"),
         index=0,
     )
 
     st.divider()
-    st.header("🎯 4. 材料強度與反算目標")
+    st.header("🎯 4. 混凝土強度與反算目標")
     fc = st.selectbox("連續壁混凝土強度 f'c (kgf/cm²)", options=(210, 245, 280, 350, 420), index=3)
+    fc_slab = st.selectbox("壁外新澆置梁版強度 f'c,slab (kgf/cm²)", options=(210, 245, 280, 350, 420), index=2)
     steel_type = st.selectbox("鋼筋材質", options=tuple(STEEL_DB.keys()), index=0)
+    d_agg = st.selectbox("粗骨材最大粒徑 d_agg (cm)", options=(1.9, 2.0, 2.5, 3.8), index=1)
     stress_ratio = st.slider("設計應力比 (Nu / Ab·fy)", 0.50, 1.00, 1.00, 0.05)
     require_ductile = st.checkbox("強制滿足延性破壞 (非鋼材標稱力 ≥ fy)", value=True)
 
+    st.divider()
+    st.header("📦 5. 施工範圍與注膠備料參數")
+    job_length_m = st.number_input("錯位施工區段總長度 (m)", 1.0, 500.0, 10.0, 1.0)
+    cartridge_ml = st.selectbox("單支植筋膠包裝容量 (ml)", options=(500, 390, 585, 1400), index=0)
+    waste_pct = st.slider("現場施工注膠損耗率 (%)", 10, 40, 20, 5)
+    
 db = REBAR_DB[orig_rebar]["db"]
 Ab = REBAR_DB[orig_rebar]["Ab"]
 fy = STEEL_DB[steel_type]["fy"]
@@ -591,6 +717,7 @@ d25_single, fbd_ref, alpha_bond = calc_ch25_with_bond_physics(
 d17_single, _, _, cNa_single, gov_mode_17 = solve_ch17_parallel_depth(
     db, Ab, fy, fu, fc, tau_k, orig_spacing, edge_c, stress_ratio, require_ductile
 )
+ext_single = calc_exterior_lap_and_hook(db, fy, fc_slab, orig_spacing)
 
 tau_ok = tau_k >= min_req_tau
 tau_msg = (
@@ -609,7 +736,7 @@ if alpha_bond > 1.0:
     )
 else:
     st.info(
-        f"🛡️ **高黏結藥劑劈裂上限控制**：τ_k ({tau_k} kgf/cm²) ≥ 混凝土基準握裹應力 f_bd,ref ({fbd_ref:.1f} kgf/cm²)，第 25 章伸展長度受「混凝土保護層劈裂上限」控制（α_bond = 1.00），不再因調高 τ_k 而縮短。"
+        f"🛡️ **高黏結藥劑劈裂上限控制**：τ_k ({tau_k} kgf/cm²) ≥ 混凝土基準握裹應力 f_bd,ref ({fbd_ref:.1f} kgf/cm²)，第 25 章伸展長度受「混凝土保護層劈裂上限」控制（α_bond = 1.00）。"
     )
 
 batch_table = run_batch_all_rebars(
@@ -620,6 +747,7 @@ batch_table = run_batch_all_rebars(
     fy,
     fu,
     fc,
+    fc_slab,
     tau_k,
     is_lap,
     stress_ratio,
@@ -642,69 +770,65 @@ per_m_schemes, bars_orig_m, As_orig_m = calc_per_meter_schemes(
 )
 ref_h_geom = d17_single if (d17_single is not None and d17_single < d25_single) else d25_single
 geom_rows = build_geometry_check_rows(
-    db, orig_spacing, row_vertical_gap, edge_c, ref_h_geom, cNa_single
+    db, orig_spacing, row_vertical_gap, edge_c, ref_h_geom, cNa_single, d_agg
 )
 
-tab1, tab2, tab3 = st.tabs(
+tab1, tab2, tab3, tab4 = st.tabs(
     [
-        "📋 一、 #4 ～ #10 全號數批次總表",
-        "📐 二、 每公尺配筋換算與雙排配置圖",
-        "📏 三、 X/Y/Edge 幾何限制與黏著力規範",
+        "📋 一、 #4～#10 全號數總表",
+        "📐 二、 壁外搭接彎鉤與雙排配置圖",
+        "📏 三、 X/Y/Edge 幾何與黏著力規範",
+        "🧪 四、 注膠量估算與拉拔驗收標準",
     ]
 )
 
 with tab1:
     st.subheader(
-        f"📊 #4 ～ #10 全號數雙軌埋深檢核總表（sx = {orig_spacing} cm, Edge = {edge_c} cm, 上限 {max_allow_depth:.0f} cm）"
+        f"📊 #4 ～ #10 全號數壁內埋深與壁外伸出長度總表（壁內上限 {max_allow_depth:.0f} cm，壁外 f'c,slab = {fc_slab} kgf/cm²）"
     )
     st.dataframe(batch_table, width="stretch", hide_index=True)
-    st.caption(
-        "註：表中第 25 章埋深已納入 α_bond 物理修正；第 17 章埋深同步標示控制破壞模式（黏結拉出 Na 或混凝土錐裂 Ncb）。"
-    )
 
 with tab2:
-    st.subheader(f"📐 【{orig_rebar} @ {orig_spacing} cm】每公尺寬度配筋換算與雙排配置圖")
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("原設計每公尺支數", f"{bars_orig_m:.2f} 支/m", f"間距 @ {orig_spacing} cm")
-    c2.metric("原設計每公尺總斷面積", f"{As_orig_m:.2f} cm²/m", f"單支 Ab = {Ab} cm²")
-    c3.metric("原號數第25章埋深", f"{d25_single} cm", f"α_bond = {alpha_bond:.2f}")
-    c4.metric(
-        "原號數第17章埋深",
-        f"{d17_single} cm" if d17_single is not None else "群組錐裂超限",
-        gov_mode_17,
+    st.subheader(f"🔗 1. 【{orig_rebar}】壁外新澆置梁版內伸出長度計算（f'c,slab = {fc_slab} kgf/cm²）")
+    e1, e2, e3, e4, e5 = st.columns(5)
+    e1.metric("下層筋直線搭接", f"{ext_single['lap_bot']} cm", f"基本 ld={ext_single['ld_bot']} cm")
+    e2.metric("上層筋直線搭接", f"{ext_single['lap_top']} cm", "含 ψt=1.3 與 B級搭接")
+    e3.metric("90°/180° 標準彎鉤", f"{ext_single['ldh']} cm", "規範 ldh 伸展長度")
+    e4.metric("SA級摩擦焊最短預留", f"{ext_single['sa_coupler']} cm", "含夾持與隔熱緩衝 (≥8db)")
+    e5.metric(
+        "壁內建議植入深度",
+        f"{min(d25_single, d17_single) if d17_single else d25_single} cm",
+        f"壁內上限 {max_allow_depth:.0f} cm",
+    )
+    st.caption(
+        "🔥 現場摩擦焊施工安全提示：摩擦焊介面高溫達 1,000°C 以上，施焊時植筋根部務必包覆濕布或冷卻散熱夾具，避免熱傳導使壁內植筋膠超過熱變形溫度（~60°C）而軟化脫膠。"
     )
 
+    st.divider()
+    st.subheader(f"📐 2. 【{orig_rebar} @ {orig_spacing} cm】每公尺寬度雙排替代配置圖")
+
     fig_buffer = None
+    active_scheme = None
     if per_m_schemes:
         scheme_names = tuple(s["方案名稱"] for s in per_m_schemes)
-        selected_name = st.selectbox("選擇要檢視與匯出圖面的雙排替代方案：", options=scheme_names)
-        chosen_scheme = next(s for s in per_m_schemes if s["方案名稱"] == selected_name)
+        selected_name = st.selectbox("選擇雙排替代配置方案：", options=scheme_names)
+        active_scheme = next(s for s in per_m_schemes if s["方案名稱"] == selected_name)
 
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("替代每公尺總支數", f"{chosen_scheme['total_bars_m']} 支/m", "上下雙排各半")
-        m2.metric(
-            "單排水平中心距 sx",
-            f"{chosen_scheme['s_each_row']} cm",
-            f"垂直排距 sy = {chosen_scheme['row_gap']:.0f} cm",
-        )
-        m3.metric("梅花錯開斜向中心距", f"{chosen_scheme['diag_spacing']} cm", "確保圍束間距")
-        m4.metric(
-            "建議安全植入深度",
-            f"{chosen_scheme['rec_depth']} cm",
-            chosen_scheme["method"],
-        )
+        m1.metric("替代每公尺總支數", f"{active_scheme['total_bars_m']} 支/m", "上下雙排各半")
+        m2.metric("單排水平中心距 sx", f"{active_scheme['s_each_row']} cm", f"垂直排距 sy = {active_scheme['row_gap']:.0f} cm")
+        m3.metric("梅花錯開斜向中心距", f"{active_scheme['diag_spacing']} cm", "滿足圍束間距")
+        m4.metric("替代壁內植入深度", f"{active_scheme['rec_depth']} cm", active_scheme["method"])
 
-        st.markdown("#### 🖼️ 連續壁每公尺寬度（100 cm）雙排梅花錯開鑽孔配置圖")
-        fig_buffer = plot_staggered_layout(orig_rebar, orig_spacing, chosen_scheme)
+        fig_buffer = plot_staggered_layout(orig_rebar, orig_spacing, active_scheme)
         st.image(fig_buffer, width="content")
     else:
         st.info(
-            f"💡 目前條件下，原設計 **{orig_rebar} @ {orig_spacing} cm** 可直接依原號數施作（無須拆分為小號數雙排）；若想測試雙排配置圖，可將左側「重點檢核鋼筋號數」調整為 **#8、#9 或 #10**。"
+            f"💡 目前條件下，原設計 **{orig_rebar} @ {orig_spacing} cm** 可直接依原號數施作（無須拆分為小號數雙排）。"
         )
 
 with tab3:
-    st.subheader(f"📏 【{orig_rebar}】X、Y 間距與 Edge 邊距空間限制檢核表")
+    st.subheader(f"📏 【{orig_rebar}】X、Y 間距與 Edge 邊距雙重標準檢核表")
     st.dataframe(geom_rows, width="stretch", hide_index=True)
 
     st.subheader("📚 各種工程 Case 植筋膠最小黏著力規定總表")
@@ -718,18 +842,56 @@ with tab3:
     ]
     st.dataframe(case_ref_rows, width="stretch", hide_index=True)
 
+with tab4:
+    st.subheader("🧪 施工注膠備料估算與現場非破壞拉拔試驗驗收標準表")
+
+    if active_scheme is not None:
+        qa_rebar = active_scheme["cand_key"]
+        qa_hef = active_scheme["rec_depth"]
+        qa_bars_per_m = active_scheme["total_bars_m"]
+        qa_note = f"依【替代方案：{active_scheme['方案名稱']}】計算"
+    else:
+        qa_rebar = orig_rebar
+        qa_hef = max(min(d25_single, d17_single) if d17_single else d25_single, 30)
+        qa_bars_per_m = bars_orig_m
+        qa_note = f"依【原設計：{orig_rebar} @ {orig_spacing} cm】計算"
+
+    total_bars_job = math.ceil(qa_bars_per_m * job_length_m)
+    qa_res = calc_grout_and_pullout_qa(
+        qa_rebar, qa_hef, total_bars_job, cartridge_ml, waste_pct, fy, stress_ratio
+    )
+
+    st.info(f"📌 目前計算基準：**{qa_note}** ｜ 施工區段長度 **{job_length_m} m**（共計 **{total_bars_job} 支**植筋）")
+
+    q1, q2, q3, q4 = st.columns(4)
+    q1.metric("標準鑽孔直徑 d0", f"{qa_res['d0_mm']} mm", f"鋼筋 {qa_rebar} / 埋深 {qa_hef} cm")
+    q2.metric("單孔含損耗注膠量", f"{qa_res['vol_gross_ml']} ml/孔", f"淨體積 {qa_res['vol_net_ml']} ml (+{waste_pct}%)")
+    q3.metric(f"預估植筋膠總支數 ({cartridge_ml}ml)", f"{qa_res['cartridges_needed']} 支", f"總用量 {qa_res['total_vol_ml']:,.0f} ml")
+    q4.metric("現場拉拔試驗拉力 (Proof Load)", f"{qa_res['proof_load_kgf']:,.0f} kgf", f"至少抽驗 {qa_res['sample_count']} 支 (5%)")
+
+    qa_table_display = [
+        {"品管與備料檢核項目": "施工區段總植筋支數", "計算結果與標準": f"{total_bars_job} 支（每公尺 {qa_bars_per_m:.1f} 支 × {job_length_m} m）"},
+        {"品管與備料檢核項目": "鑽孔孔徑與深度規格", "計算結果與標準": f"鑽孔直徑 d0 = {qa_res['d0_mm']} mm，健全混凝土有效埋深 hef = {qa_hef} cm"},
+        {"品管與備料檢核項目": "單孔注膠體積（淨量 / 含損耗）", "計算結果與標準": f"淨體積 {qa_res['vol_net_ml']} ml / 含 {waste_pct}% 損耗共 {qa_res['vol_gross_ml']} ml"},
+        {"品管與備料檢核項目": "整批工程植筋膠採購支數", "計算結果與標準": f"總用膠量 {qa_res['total_vol_ml']:,.0f} ml ➔ 需準備 {qa_res['cartridges_needed']} 支（{cartridge_ml} ml/支）"},
+        {"品管與備料檢核項目": "現場拉拔試驗抽驗數量", "計算結果與標準": f"依規範抽驗總支數 5% 且不少於 3 支 ➔ 至少抽驗 {qa_res['sample_count']} 支"},
+        {"品管與備料檢核項目": "現場非破壞試驗拉力 (Proof Load)", "計算結果與標準": f"{qa_res['proof_load_kgf']:,.0f} kgf（1.25倍設計拉力，且不超過 0.80 Ab·fy = {0.8*qa_res['yield_load_kgf']:,.0f} kgf）"},
+        {"品管與備料檢核項目": "現場試驗合格判定條件", "計算結果與標準": "加載至試驗拉力並持荷 2 分鐘，無滑移、無混凝土劈裂、鋼筋無降伏變形為合格。"},
+    ]
+    st.dataframe(qa_table_display, width="stretch", hide_index=True)
+
 # ==========================================
-# 7. Word 計算書一鍵匯出
+# 8. Word 完整計算書一鍵匯出
 # ==========================================
 st.divider()
-st.subheader("📄 匯出完整結構計算書 (含物理修正、批次總表、配置圖與幾何檢核)")
+st.subheader("📄 匯出完整結構設計與施工品管計算書 (Word)")
 
 inputs_doc = {
     "連續壁幾何與深度限制": f"壁厚 {wall_thick:.0f} cm，剔除劣質層 {bad_layer:.0f} cm，最大允許埋深 {max_allow_depth:.0f} cm",
     "重點檢核配筋與間距": f"{orig_rebar} @ sx={orig_spacing} cm，雙排排距 sy={row_vertical_gap} cm，Edge={edge_c} cm",
-    "材料強度與物理修正": f"f'c = {fc} kgf/cm² (基準 f_bd,ref = {fbd_ref:.1f} kgf/cm²)，{steel_type}",
-    "藥劑黏著力與修正係數": f"τ_k = {tau_k} kgf/cm² (第25章修正係數 α_bond = {alpha_bond:.2f})",
-    "受力與延性目標": f"{splice_mode}，設計應力比 = {stress_ratio:.2f}，延性檢核 = {'開啟' if require_ductile else '關閉'}",
+    "材料強度設定": f"連續壁 f'c = {fc} kgf/cm²，壁外新澆置梁版 f'c,slab = {fc_slab} kgf/cm²，{steel_type}",
+    "藥劑黏著力與物理修正": f"τ_k = {tau_k} kgf/cm² (基準 f_bd,ref = {fbd_ref:.1f} kgf/cm²，α_bond = {alpha_bond:.2f})",
+    "施工區段與備料條件": f"施工長度 {job_length_m} m，單支膠容量 {cartridge_ml} ml，預估損耗 {waste_pct}%",
 }
 
 word_bytes = build_full_word_report(
@@ -737,16 +899,22 @@ word_bytes = build_full_word_report(
     batch_table,
     orig_rebar,
     orig_spacing,
+    ext_single,
     per_m_schemes,
     fig_buffer,
     geom_rows,
+    qa_res,
+    qa_rebar,
+    qa_hef,
+    total_bars_job,
+    cartridge_ml,
     tau_msg,
 )
 rebar_clean = next(iter(orig_rebar.split()))
 
 st.download_button(
-    label="⬇️ 下載完整 Word 計算書 (.docx)",
+    label="⬇️ 下載完整 Word 計算書 (.docx) [含壁外搭接、全號數總表、配置圖 & 品管驗收表]",
     data=word_bytes,
-    file_name=f"ACI318_連續壁植筋完整計算書_{rebar_clean}_fc{fc}_{datetime.now().strftime('%Y%m%d')}.docx",
+    file_name=f"ACI318_連續壁植筋完整設計與品管計算書_{rebar_clean}_fc{fc}_{datetime.now().strftime('%Y%m%d')}.docx",
     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 )
